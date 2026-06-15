@@ -14,12 +14,6 @@ from app.config import config
 from app.models.schema import VideoScriptRequest, VideoSocialMetadataRequest
 from app.services import llm
 
-RUN_INTEGRATION_TESTS = os.environ.get("MPT_RUN_INTEGRATION_TESTS", "").lower() in {
-    "1",
-    "true",
-    "yes",
-}
-
 
 class TestScriptPromptOptions(unittest.TestCase):
     def test_normalize_text_response_removes_think_blocks(self):
@@ -901,15 +895,129 @@ class TestSocialMetadata(unittest.TestCase):
         )
 
 
+class TestReviewScript(unittest.TestCase):
+    def test_review_passes_on_pass_keyword(self):
+        with patch.object(llm, "_generate_response", return_value="PASS\nLooks good."):
+            passed, feedback = llm._review_script("script", "subject", 1)
+        self.assertTrue(passed)
+        self.assertEqual(feedback, "")
+
+    def test_review_rejects_with_feedback(self):
+        with patch.object(
+            llm, "_generate_response", return_value="Need more detail on topic X."
+        ):
+            passed, feedback = llm._review_script("script", "subject", 1)
+        self.assertFalse(passed)
+        self.assertIn("detail", feedback)
+
+    def test_review_retries_on_empty_response(self):
+        with patch.object(
+            llm,
+            "_generate_response",
+            side_effect=["", "", "PASS"],
+        ):
+            passed, feedback = llm._review_script("script", "subject", 1)
+        self.assertTrue(passed)
+
+    def test_review_returns_pass_on_all_exceptions(self):
+        with patch.object(
+            llm, "_generate_response", side_effect=RuntimeError("API down")
+        ):
+            passed, feedback = llm._review_script("script", "subject", 1)
+        self.assertTrue(passed)
+        self.assertEqual(feedback, "")
+
+
+class TestGenerateScriptWithRefinement(unittest.TestCase):
+    def test_returns_script_on_first_pass(self):
+        with patch.object(
+            llm, "generate_script", return_value="good script"
+        ), patch.object(
+            llm, "_review_script", return_value=(True, "")
+        ):
+            result = llm.generate_script_with_refinement(
+                video_subject="test",
+                language="en",
+                paragraph_number=1,
+                max_refine_iterations=3,
+            )
+        self.assertEqual(result, "good script")
+
+    def test_refines_on_rejection(self):
+        with patch.object(
+            llm, "generate_script", return_value="bad"
+        ), patch.object(
+            llm,
+            "_review_script",
+            side_effect=[
+                (False, "too short"),
+                (True, ""),
+            ],
+        ), patch.object(
+            llm, "_generate_response", return_value="improved script"
+        ):
+            result = llm.generate_script_with_refinement(
+                video_subject="test",
+                language="en",
+                paragraph_number=2,
+                max_refine_iterations=3,
+            )
+        self.assertEqual(result, "improved script")
+
+    def test_max_iterations_respected(self):
+        with patch.object(
+            llm, "generate_script", return_value="bad"
+        ), patch.object(
+            llm,
+            "_review_script",
+            return_value=(False, "still bad"),
+        ), patch.object(
+            llm, "_generate_response", return_value="refined"
+        ):
+            result = llm.generate_script_with_refinement(
+                video_subject="test",
+                language="en",
+                paragraph_number=1,
+                max_refine_iterations=2,
+            )
+        self.assertEqual(result, "refined")
+
+    def test_empty_script_returns_empty_string(self):
+        with patch.object(llm, "generate_script", return_value=""):
+            result = llm.generate_script_with_refinement(
+                video_subject="test",
+                language="en",
+                paragraph_number=1,
+            )
+        self.assertEqual(result, "")
+
+    def test_refine_retries_on_empty_response(self):
+        with patch.object(
+            llm, "generate_script", return_value="needs work"
+        ), patch.object(
+            llm,
+            "_review_script",
+            side_effect=[(False, "fix it"), (True, "")],
+        ), patch.object(
+            llm,
+            "_generate_response",
+            side_effect=["", "", "final version"],
+        ):
+            result = llm.generate_script_with_refinement(
+                video_subject="test",
+                language="en",
+                paragraph_number=1,
+                max_refine_iterations=3,
+            )
+        self.assertEqual(result, "final version")
+
+
 FOUNDRY_KEY = os.environ.get("ANTHROPIC_FOUNDRY_API_KEY", "")
 FOUNDRY_BASE = "https://amanrai-test-resource.services.ai.azure.com/anthropic"
 FOUNDRY_MODEL = "azure_ai/claude-sonnet-4-6"
 
 
-@unittest.skipUnless(
-    RUN_INTEGRATION_TESTS and FOUNDRY_KEY,
-    "MPT_RUN_INTEGRATION_TESTS and ANTHROPIC_FOUNDRY_API_KEY not set",
-)
+@unittest.skipUnless(FOUNDRY_KEY, "ANTHROPIC_FOUNDRY_API_KEY not set")
 class TestLiteLLMLiveIntegration(unittest.TestCase):
     def setUp(self):
         self.original_app_config = dict(config.app)
