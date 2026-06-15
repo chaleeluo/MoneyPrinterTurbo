@@ -10,20 +10,38 @@ from app.models import const
 from app.models.schema import VideoConcatMode, VideoParams
 from app.services import llm, material, subtitle, video, voice, upload_post
 from app.services import state as sm
-from app.utils import file_security, utils
+from app.services.agent_orchestrator import run_pipeline as run_multi_agent_pipeline
+from app.utils import utils
 
 
 def generate_script(task_id, params):
     logger.info("\n\n## generating video script")
     video_script = params.video_script.strip()
     if not video_script:
-        video_script = llm.generate_script(
-            video_subject=params.video_subject,
-            language=params.video_language,
-            paragraph_number=params.paragraph_number,
-            video_script_prompt=params.video_script_prompt,
-            custom_system_prompt=params.custom_system_prompt,
-        )
+        enable_multi_agent = config.app.get("enable_multi_agent", False)
+        if enable_multi_agent:
+            logger.info("[task] using multi-agent orchestration")
+            result = run_multi_agent_pipeline(
+                task_id=task_id,
+                video_subject=params.video_subject,
+                language=params.video_language,
+                paragraph_number=params.paragraph_number,
+                video_script_prompt=params.video_script_prompt,
+                custom_system_prompt=params.custom_system_prompt,
+                amount=8 if params.match_materials_to_script else 5,
+                match_script_order=params.match_materials_to_script,
+            )
+            video_script = result["script"]
+            if "terms" in result and not params.video_terms:
+                params.video_terms = result["terms"]
+        else:
+            video_script = llm.generate_script(
+                video_subject=params.video_subject,
+                language=params.video_language,
+                paragraph_number=params.paragraph_number,
+                video_script_prompt=params.video_script_prompt,
+                custom_system_prompt=params.custom_system_prompt,
+            )
     else:
         logger.debug(f"video script: \n{video_script}")
 
@@ -78,45 +96,6 @@ def save_script_data(task_id, video_script, video_terms, params):
         f.write(utils.to_json(script_data))
 
 
-def resolve_custom_audio_file(task_id: str, custom_audio_file: str | None) -> str:
-    requested_file = (custom_audio_file or "").strip()
-    if not requested_file:
-        return ""
-
-    task_dir = utils.task_dir(task_id)
-    try:
-        return file_security.resolve_path_within_directory(
-            task_dir,
-            requested_file,
-        )
-    except ValueError as exc:
-        task_dir_error = exc
-
-    server_audio_file = path.realpath(
-        requested_file
-        if path.isabs(requested_file)
-        else path.join(utils.root_dir(), requested_file)
-    )
-    if not path.isabs(requested_file):
-        project_root = path.realpath(utils.root_dir())
-        try:
-            if path.commonpath([project_root, server_audio_file]) != project_root:
-                raise ValueError(
-                    "relative custom audio paths must stay within the project directory"
-                )
-        except ValueError as exc:
-            raise ValueError(
-                "custom audio file must be task-local or an existing server-side file"
-            ) from exc
-
-    if not path.isfile(server_audio_file):
-        raise ValueError(
-            "custom audio file does not exist or is not a file"
-        ) from task_dir_error
-
-    return server_audio_file
-
-
 def generate_audio(task_id, params, video_script):
     '''
     Generate audio for the video script.
@@ -131,21 +110,14 @@ def generate_audio(task_id, params, video_script):
     logger.info("\n\n## generating audio")
     # /audio 和 /subtitle 请求模型不包含 custom_audio_file，
     # 这里统一做兼容读取，避免直调接口时抛属性错误。
-    requested_custom_audio_file = getattr(params, "custom_audio_file", None)
-    try:
-        custom_audio_file = resolve_custom_audio_file(
-            task_id, requested_custom_audio_file
-        )
-    except ValueError as exc:
-        logger.error(
-            "custom audio file is invalid, "
-            f"task_id: {task_id}, path: {requested_custom_audio_file}, error: {str(exc)}"
-        )
-        sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
-        return None, None, None
-
-    if not custom_audio_file:
-        logger.info("no custom audio file provided, using TTS to generate audio.")
+    custom_audio_file = getattr(params, "custom_audio_file", None)
+    if not custom_audio_file or not os.path.exists(custom_audio_file):
+        if custom_audio_file:
+            logger.warning(
+                f"custom audio file not found: {custom_audio_file}, using TTS to generate audio."
+            )
+        else:
+            logger.info("no custom audio file provided, using TTS to generate audio.")
         audio_file = path.join(utils.task_dir(task_id), "audio.mp3")
         sub_maker = voice.tts(
             text=video_script,
