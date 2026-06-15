@@ -1,6 +1,7 @@
 import json
-import logging
+import random
 import re
+import time
 import requests
 from typing import List
 
@@ -9,6 +10,7 @@ from openai import AzureOpenAI, OpenAI
 from openai.types.chat import ChatCompletion
 
 from app.config import config
+from app.utils.context_budget import compress_prompt, global_budget
 
 _max_retries = 5
 _DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
@@ -35,6 +37,22 @@ Generate a script for a video, depending on the subject of the video.
 6. do not include "voiceover", "narrator" or similar indicators of what should be spoken at the beginning of each paragraph or line.
 7. you must not mention the prompt, or anything about the script itself. also, never talk about the amount of paragraphs or lines. just write the script.
 8. respond in the same language as the video subject.
+""".strip()
+
+MAX_REFINE_ITERATIONS = 3
+
+DEFAULT_REVIEWER_SYSTEM_PROMPT = """
+# Role: Video Script Reviewer
+
+## Goal:
+Review a video script for quality, coherence, and completeness.
+
+## Constraints:
+1. Analyze the script for these issues: too short, too long, off-topic, missing paragraphs, repetitive content, unnatural flow.
+2. If the script is good quality (meets the paragraph count, on-topic, natural flow), return "PASS" as the first line.
+3. If improvements are needed, return specific, actionable feedback line by line.
+4. Keep feedback concise — at most 5 bullet points.
+5. Respond in the same language as the script.
 """.strip()
 
 
@@ -121,6 +139,7 @@ def _generate_response(prompt: str) -> str:
         content = ""
         llm_provider = config.app.get("llm_provider", "openai")
         logger.info(f"llm provider: {llm_provider}")
+        prompt = compress_prompt(prompt, max_chars=12000)
         if llm_provider == "g4f":
             if not config.app.get("enable_g4f", False):
                 raise ValueError(
@@ -700,6 +719,93 @@ def generate_script(
     else:
         logger.success(f"completed: \n{final_script}")
     return final_script.strip()
+
+
+def _review_script(script: str, video_subject: str, paragraph_number: int) -> tuple[bool, str]:
+    review_prompt = f"""
+{DEFAULT_REVIEWER_SYSTEM_PROMPT}
+
+## Script to Review:
+{script}
+
+## Requirements:
+- Expected paragraph count: {paragraph_number}
+- Video subject: {video_subject}
+
+## Review Output:
+""".strip()
+    for i in range(3):
+        try:
+            feedback = _generate_response(review_prompt)
+            if not feedback:
+                continue
+            if feedback.strip().startswith("PASS"):
+                return True, ""
+            return False, feedback
+        except Exception as e:
+            logger.warning(f"review attempt {i+1}/3 failed: {e}")
+            if i < 2:
+                time.sleep(1.0 + random.uniform(0, 0.5))
+    return True, ""
+
+
+def generate_script_with_refinement(
+    video_subject: str,
+    language: str = "",
+    paragraph_number: int = 1,
+    video_script_prompt: str = "",
+    custom_system_prompt: str = "",
+    max_refine_iterations: int = MAX_REFINE_ITERATIONS,
+) -> str:
+    script = generate_script(
+        video_subject=video_subject,
+        language=language,
+        paragraph_number=paragraph_number,
+        video_script_prompt=video_script_prompt,
+        custom_system_prompt=custom_system_prompt,
+    )
+    if not script:
+        return script
+
+    for iteration in range(max_refine_iterations):
+        passed, feedback = _review_script(script, video_subject, paragraph_number)
+        if passed:
+            logger.success(f"refine iteration {iteration + 1}: script passed review")
+            return script
+
+        logger.info(f"refine iteration {iteration + 1}: applying feedback")
+        refine_prompt = f"""
+# Role: Script Refiner
+
+## Task:
+Improve the video script below based on the reviewer's feedback.
+
+## Original Script:
+{script}
+
+## Reviewer Feedback:
+{feedback}
+
+## Requirements:
+- Fix all issues mentioned in the feedback
+- Keep the same language and tone
+- Return only the refined script, no commentary
+- Maintain approximately {paragraph_number} paragraphs
+- Video subject: {video_subject}
+""".strip()
+        for i in range(3):
+            try:
+                refined = _generate_response(refine_prompt)
+                if refined:
+                    script = refined.strip()
+                    break
+            except Exception as e:
+                logger.warning(f"refine attempt {i+1}/3 failed: {e}")
+                if i < 2:
+                    time.sleep(1.0 + random.uniform(0, 0.5))
+
+    logger.success(f"refined script after {max_refine_iterations} iterations")
+    return script
 
 
 def _strip_code_fence(text: str) -> str:
